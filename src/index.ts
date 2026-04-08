@@ -1,5 +1,5 @@
 /**
- * @m13v/assrt — AI-powered QA testing SDK.
+ * @assrt-ai/assrt — AI-powered QA testing SDK.
  *
  * Public API for programmatic usage of the Assrt testing engine.
  */
