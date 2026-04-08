@@ -1,0 +1,41 @@
+{
+  "name": "@m13v/assrt",
+  "version": "0.3.3",
+  "description": "AI-powered QA testing from the command line and as an MCP server for coding agents",
+  "keywords": ["testing", "qa", "ai", "mcp", "playwright", "browser", "claude", "automation"],
+  "license": "MIT",
+  "author": "Assrt <matt@assrt.ai>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/assrt-ai/assrt-freestyle.git"
+  },
+  "homepage": "https://assrt.ai",
+  "bin": {
+    "assrt": "cli.mjs",
+    "assrt-mcp": "mcp/server.mjs"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "cli.mjs",
+    "mcp/",
+    "chunk-*.mjs"
+  ],
+  "scripts": {
+    "postinstall": "node cli.mjs setup 2>/dev/null || true"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@google/genai": "^1.46.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@playwright/mcp": "^0.0.70",
+    "freestyle-sandboxes": "^0.1.39",
+    "@freestyle-sh/with-nodejs": "^0.2.8",
+    "undici": "^7.24.7",
+    "posthog-node": "^5.21.2",
+    "ws": "^8.20.0",
+    "firebase-admin": "^13.7.0"
+  }
+}
