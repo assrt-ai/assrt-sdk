@@ -1,0 +1,6 @@
+node_modules/
+dist/
+npm/*.mjs
+npm/mcp/
+scripts/
+.env*
