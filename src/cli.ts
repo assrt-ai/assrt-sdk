@@ -172,7 +172,7 @@ function setupAssrt(): void {
       const mcpConfig = JSON.stringify({
         type: "stdio",
         command: "npx",
-        args: ["-y", "-p", "@m13v/assrt", "assrt-mcp"],
+        args: ["-y", "-p", "@assrt-ai/assrt", "assrt-mcp"],
       });
       execSync(`claude mcp add-json assrt '${mcpConfig}'`, {
         stdio: ["pipe", "pipe", "pipe"],
