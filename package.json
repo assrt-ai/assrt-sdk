@@ -1,21 +1,35 @@
 {
-  "name": "@assrt/sdk",
+  "name": "assrt-sdk",
   "version": "0.1.0",
-  "description": "AI-powered testing framework built on Playwright. Write tests in plain English.",
-  "author": "Assrt <i@m13v.com>",
-  "license": "MIT",
-  "homepage": "https://assrt.ai",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/assrt-ai/assrt-sdk"
+  "private": true,
+  "bin": {
+    "assrt": "./dist/cli.mjs",
+    "assrt-mcp": "./dist/mcp/server.mjs"
   },
-  "keywords": [
-    "testing",
-    "playwright",
-    "ai",
-    "e2e",
-    "automation",
-    "self-healing"
-  ],
-  "main": "index.js"
+  "scripts": {
+    "build": "tsup",
+    "prepublish:npm": "tsup && rm -f npm/*.mjs npm/mcp/*.mjs && cp dist/*.mjs npm/ && mkdir -p npm/mcp && cp dist/mcp/*.mjs npm/mcp/",
+    "publish:npm": "npm run prepublish:npm && cd npm && npm publish --tag beta --access public",
+    "publish:npm:stable": "npm run prepublish:npm && cd npm && npm publish --access public"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@google/genai": "^1.46.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@playwright/mcp": "^0.0.70",
+    "posthog-node": "^5.21.2",
+    "ws": "^8.20.0",
+    "zod": "^4.3.6"
+  },
+  "optionalDependencies": {
+    "freestyle-sandboxes": "^0.1.39",
+    "@freestyle-sh/with-nodejs": "^0.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.18.1",
+    "tsup": "^8.5.1",
+    "typescript": "^5.7.2",
+    "undici": "^7.24.7"
+  }
 }
