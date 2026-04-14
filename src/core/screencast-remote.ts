@@ -32,7 +32,7 @@ export class RemoteScreencastSession {
   async start(): Promise<void> {
     if (this.running) return;
 
-    console.log(`[screencast] connecting to ${this.screencastUrl} ...`);
+    console.error(`[screencast] connecting to ${this.screencastUrl} ...`);
 
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -48,7 +48,7 @@ export class RemoteScreencastSession {
         this.ws = ws;
         this.running = true;
         clearTimeout(timeout);
-        console.log("[screencast] connected, waiting for frames...");
+        console.error("[screencast] connected, waiting for frames...");
         resolve();
       });
 
@@ -73,7 +73,7 @@ export class RemoteScreencastSession {
         this.running = false;
         this.ws = null;
         if (!this.running) {
-          console.log(`[screencast] connection closed (code=${code}, reason=${reason})`);
+          console.error(`[screencast] connection closed (code=${code}, reason=${reason})`);
         }
       });
     });

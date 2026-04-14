@@ -18,11 +18,12 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 
-/** Structured log with [freestyle] prefix so Cloud Run captures it as textPayload. */
+/** Structured log with [freestyle] prefix so Cloud Run captures it as textPayload.
+ *  Always writes to stderr so the MCP stdio JSON-RPC channel on stdout stays clean. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function flog(level: "log" | "warn" | "error", data: Record<string, any>) {
+function flog(_level: "log" | "warn" | "error", data: Record<string, any>) {
   const line = "[freestyle] " + JSON.stringify({ ...data, ts: new Date().toISOString() });
-  console[level](line);
+  console.error(line);
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

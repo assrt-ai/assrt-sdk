@@ -361,7 +361,7 @@ export class TestAgent {
 
   async run(url: string, scenariosText: string): Promise<TestReport> {
     const startTime = Date.now();
-    console.log(JSON.stringify({ event: "agent.run.start", url, mode: this.mode, model: this.model, ts: new Date().toISOString() }));
+    console.error(JSON.stringify({ event: "agent.run.start", url, mode: this.mode, model: this.model, ts: new Date().toISOString() }));
     if (this.mode === "local") {
       this.emit("status", { message: "Launching local browser..." });
       await this.browser.launchLocal(this.videoDir || undefined, this.headed);
@@ -377,7 +377,7 @@ export class TestAgent {
       await this.browser.launch();
     }
     const launchMs = Date.now() - startTime;
-    console.log(JSON.stringify({ event: "agent.browser.launched", durationMs: launchMs, ts: new Date().toISOString() }));
+    console.error(JSON.stringify({ event: "agent.browser.launched", durationMs: launchMs, ts: new Date().toISOString() }));
     this.emit("status", { message: "Browser launched via Playwright MCP" });
 
     // Send the screencast WebSocket URL so the client can connect directly
@@ -406,7 +406,7 @@ export class TestAgent {
 
     const tNav = Date.now();
     await this.browser.navigate(url);
-    console.log(JSON.stringify({ event: "agent.navigate.done", url, durationMs: Date.now() - tNav, ts: new Date().toISOString() }));
+    console.error(JSON.stringify({ event: "agent.navigate.done", url, durationMs: Date.now() - tNav, ts: new Date().toISOString() }));
     this.emit("status", { message: `Navigated to ${url}` });
 
     this.queueDiscoverPage(url);
@@ -579,7 +579,7 @@ export class TestAgent {
     const initialSnapshot = await this.browser.snapshot();
     const initialScreenshot = await this.browser.screenshot();
     if (initialScreenshot) {
-      console.log(JSON.stringify({ event: "agent.screenshot.emit", size: initialScreenshot.length, ts: new Date().toISOString() }));
+      console.error(JSON.stringify({ event: "agent.screenshot.emit", size: initialScreenshot.length, ts: new Date().toISOString() }));
       this.emit("screenshot", { base64: initialScreenshot });
     }
 
@@ -948,7 +948,7 @@ export class TestAgent {
         // Screenshot after visual actions
         let screenshotData: string | null = null;
         if (!["snapshot", "wait", "wait_for_stable", "assert", "complete_scenario", "create_temp_email", "wait_for_verification_code", "check_email_inbox", "screenshot", "evaluate", "http_request"].includes(toolCall.name)) {
-          try { screenshotData = await this.browser.screenshot(); if (screenshotData) { console.log(JSON.stringify({ event: "agent.screenshot.emit", size: screenshotData.length, ts: new Date().toISOString() })); this.emit("screenshot", { base64: screenshotData }); } } catch { /* */ }
+          try { screenshotData = await this.browser.screenshot(); if (screenshotData) { console.error(JSON.stringify({ event: "agent.screenshot.emit", size: screenshotData.length, ts: new Date().toISOString() })); this.emit("screenshot", { base64: screenshotData }); } } catch { /* */ }
         }
 
         steps.push({ id: stepCounter, action: stepAction, description: stepDescription, status: stepStatus, timestamp: Date.now() });

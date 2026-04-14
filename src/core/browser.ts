@@ -135,7 +135,7 @@ export class McpBrowserManager {
       "@modelcontextprotocol/sdk/client/sse.js"
     );
 
-    console.log(JSON.stringify({ event: "browser.mcp.connect_start", mode: "existing", sseUrl, ts: new Date().toISOString() }));
+    console.error(JSON.stringify({ event: "browser.mcp.connect_start", mode: "existing", sseUrl, ts: new Date().toISOString() }));
     const tConn = Date.now();
     const transport = new SSEClientTransport(new URL(sseUrl));
     this.client = new Client(
@@ -144,7 +144,7 @@ export class McpBrowserManager {
     );
     await this.client.connect(transport);
     this.vmExternallyManaged = true;
-    console.log(JSON.stringify({ event: "browser.mcp.connected", mode: "existing", durationMs: Date.now() - tConn, ts: new Date().toISOString() }));
+    console.error(JSON.stringify({ event: "browser.mcp.connected", mode: "existing", durationMs: Date.now() - tConn, ts: new Date().toISOString() }));
   }
 
   /** Launch browser in a remote Freestyle VM (production). */
@@ -155,7 +155,7 @@ export class McpBrowserManager {
     );
 
     this.vm = await createTestVm();
-    console.log(JSON.stringify({ event: "browser.mcp.connect_start", vmId: this.vm.vmId, sseUrl: this.vm.sseUrl, ts: new Date().toISOString() }));
+    console.error(JSON.stringify({ event: "browser.mcp.connect_start", vmId: this.vm.vmId, sseUrl: this.vm.sseUrl, ts: new Date().toISOString() }));
     const tConn = Date.now();
     const transport = new SSEClientTransport(new URL(this.vm.sseUrl));
     this.client = new Client(
@@ -163,7 +163,7 @@ export class McpBrowserManager {
       { capabilities: {} }
     );
     await this.client.connect(transport);
-    console.log(JSON.stringify({ event: "browser.mcp.connected", vmId: this.vm.vmId, durationMs: Date.now() - tConn, ts: new Date().toISOString() }));
+    console.error(JSON.stringify({ event: "browser.mcp.connected", vmId: this.vm.vmId, durationMs: Date.now() - tConn, ts: new Date().toISOString() }));
   }
 
   /** Launch browser locally via Playwright MCP over stdio (CLI mode).
@@ -183,7 +183,7 @@ export class McpBrowserManager {
     const require_ = createRequire(import.meta.url);
     const pkgDir = dirname(require_.resolve("@playwright/mcp/package.json"));
     const cliPath = join(pkgDir, "cli.js");
-    console.log("[browser] spawning local Playwright MCP via stdio");
+    console.error("[browser] spawning local Playwright MCP via stdio");
     const tConn = Date.now();
 
     // Use an isolated user-data-dir so assrt's browser doesn't conflict with
@@ -191,7 +191,7 @@ export class McpBrowserManager {
     const userDataDir = join(tmpdir(), `assrt-browser-${Date.now()}`);
     const args = [cliPath, "--viewport-size", "1600x900", "--user-data-dir", userDataDir];
     if (!headed) args.splice(1, 0, "--headless");
-    console.log(`[browser] launch mode: ${headed ? "headed" : "headless"}`);
+    console.error(`[browser] launch mode: ${headed ? "headed" : "headless"}`);
 
     // If videoDir is provided, write a temp config file enabling Playwright video recording
     if (videoDir) {
@@ -211,7 +211,7 @@ export class McpBrowserManager {
       writeFileSync(configPath, JSON.stringify(config));
       args.push("--config", configPath);
       this.videoDir = videoDir;
-      console.log(`[browser] video recording enabled → ${videoDir}`);
+      console.error(`[browser] video recording enabled → ${videoDir}`);
     }
 
     const transport = new StdioClientTransport({
@@ -225,7 +225,7 @@ export class McpBrowserManager {
       { capabilities: {} }
     );
     await this.client.connect(transport);
-    console.log(
+    console.error(
       `[browser] local MCP connected in ${((Date.now() - tConn) / 1000).toFixed(1)}s`
     );
   }
@@ -284,10 +284,10 @@ export class McpBrowserManager {
       })) as McpToolResult;
       const dt = Date.now() - t;
       const err = result.isError ? " ERROR" : "";
-      console.log(`[mcp] ${name}${argSummary} (${dt}ms)${err}`);
+      console.error(`[mcp] ${name}${argSummary} (${dt}ms)${err}`);
       return result;
     } catch (e) {
-      console.log(
+      console.error(
         `[mcp] ${name}${argSummary} THREW after ${Date.now() - t}ms: ${(e as Error).message}`
       );
       throw e;
@@ -465,16 +465,16 @@ export class McpBrowserManager {
     if (!this.vm) return false;
     const host = this.vm.sseUrl.replace(/\/sse$/, "").replace(/^https?:\/\//, "");
     const encodeUrl = `https://${host}/video/encode`;
-    console.log(`[browser] triggering video encode at ${encodeUrl}`);
+    console.error(`[browser] triggering video encode at ${encodeUrl}`);
     try {
       const resp = await fetch(encodeUrl, { method: "POST" });
       if (!resp.ok) {
         const text = await resp.text();
-        console.log(`[browser] video encode failed: ${resp.status} ${text}`);
+        console.error(`[browser] video encode failed: ${resp.status} ${text}`);
         return false;
       }
       const result = (await resp.json()) as { frames?: number; sizeBytes?: number };
-      console.log(`[browser] video encoded: ${result.frames} frames, ${result.sizeBytes} bytes`);
+      console.error(`[browser] video encoded: ${result.frames} frames, ${result.sizeBytes} bytes`);
       return true;
     } catch (err) {
       console.error(`[browser] video encode error:`, err);
@@ -487,15 +487,15 @@ export class McpBrowserManager {
     if (!this.vm) return null;
     const host = this.vm.sseUrl.replace(/\/sse$/, "").replace(/^https?:\/\//, "");
     const videoUrl = `https://${host}/video`;
-    console.log(`[browser] downloading video from ${videoUrl}`);
+    console.error(`[browser] downloading video from ${videoUrl}`);
     try {
       const resp = await fetch(videoUrl);
       if (!resp.ok) {
-        console.log(`[browser] video download failed: ${resp.status}`);
+        console.error(`[browser] video download failed: ${resp.status}`);
         return null;
       }
       const arrayBuf = await resp.arrayBuffer();
-      console.log(`[browser] video downloaded: ${arrayBuf.byteLength} bytes`);
+      console.error(`[browser] video downloaded: ${arrayBuf.byteLength} bytes`);
       return Buffer.from(arrayBuf);
     } catch (err) {
       console.error(`[browser] video download error:`, err);
@@ -527,7 +527,7 @@ export class McpBrowserManager {
     if (this.vm && !opts?.skipVmDestroy) {
       const vmId = this.vm.vmId;
       this.vm = null;
-      console.log(`[browser] close() → destroying VM ${vmId}`);
+      console.error(`[browser] close() → destroying VM ${vmId}`);
       destroyTestVm(vmId).catch((err) =>
         console.error(`[browser] failed to destroy VM ${vmId}:`, err)
       );
@@ -539,7 +539,7 @@ export class McpBrowserManager {
     if (this.vm) {
       const vmId = this.vm.vmId;
       this.vm = null;
-      console.log(`[browser] destroyVm() → destroying VM ${vmId}`);
+      console.error(`[browser] destroyVm() → destroying VM ${vmId}`);
       destroyTestVm(vmId).catch((err) =>
         console.error(`[browser] failed to destroy VM ${vmId}:`, err)
       );
