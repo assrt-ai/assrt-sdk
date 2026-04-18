@@ -1,20 +1,30 @@
 /**
- * MCP Browser Manager — talks to a remote Playwright MCP server running
- * inside an ephemeral Freestyle VM via legacy SSE transport.
+ * MCP Browser Manager — manages a local Playwright MCP server over stdio.
  *
- * On launch(), a VM is created (Chromium + @playwright/mcp baked into the
- * image), the MCP server is reached at https://<vmId>.vm.freestyle.sh/sse,
- * and the MCP SDK Client is connected. close() tears the VM down.
- *
- * Also supports CDP screencast streaming via the exposed port 8081 for
- * live JPEG frame broadcasting.
+ * Launch modes:
+ *   - launchLocal(): spawns a local Playwright MCP process (headless, headed, or extension)
  */
-
-import { createTestVm, destroyTestVm, type FreestyleVm } from "./freestyle";
-import { RemoteScreencastSession } from "./screencast-remote";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Client = any;
+
+/** Thrown when extension mode is requested but no token is available. */
+export class ExtensionTokenRequired extends Error {
+  constructor() {
+    super(
+      "Extension mode requires a one-time setup token.\n\n" +
+      "To set it up:\n" +
+      "1. Make sure Chrome is running with the Playwright MCP extension installed\n" +
+      "   (install from: https://chromewebstore.google.com/detail/playwright-mcp-bridge/gjloebkfhhlbhemfgnmpjafamelkidba)\n" +
+      "2. Run this command in your terminal:\n" +
+      "   npx @playwright/mcp@latest --extension\n" +
+      "3. Approve the connection in the Chrome dialog that appears\n" +
+      "4. Copy the token shown (PLAYWRIGHT_MCP_EXTENSION_TOKEN=...)\n" +
+      "5. Paste the token value here so I can save it for future use"
+    );
+    this.name = "ExtensionTokenRequired";
+  }
+}
 
 /* ── Injected script for visual cursor + keystroke overlay ──
  * Runs inside the remote browser page. Creates DOM overlays that appear
@@ -89,30 +99,30 @@ if (!window.__pias_cursor_injected) {
 
 export class McpBrowserManager {
   private client: Client = null;
-  private vm: FreestyleVm | null = null;
-  /** When true, close() will NOT destroy the VM — the VM is owned externally. */
-  private vmExternallyManaged = false;
 
-  /** Get the screencast WebSocket URL for direct client connection. */
-  get screencastUrl(): string | null {
-    return this.vm?.screencastUrl ?? null;
+  /** Whether the MCP client reference exists (does NOT guarantee the browser is alive). */
+  get isConnected(): boolean {
+    return this.client != null;
   }
 
-  /** Get the input WebSocket URL for user input injection. */
-  get inputUrl(): string | null {
-    return this.vm?.inputUrl ?? null;
+  /**
+   * Perform a real health check by sending a lightweight tool call with a short timeout.
+   * Returns true if the browser is alive and responding, false otherwise.
+   */
+  async isAlive(): Promise<boolean> {
+    if (!this.client) return false;
+    try {
+      await this.client.callTool(
+        { name: "browser_snapshot", arguments: {} },
+        undefined,
+        { timeout: 5000 }
+      );
+      return true;
+    } catch {
+      console.error("[browser] health check failed, browser is dead");
+      return false;
+    }
   }
-
-  /** Get the VNC WebSocket URL for noVNC connection. */
-  get vncUrl(): string | null {
-    return this.vm?.vncUrl ?? null;
-  }
-
-  /** Get the Freestyle VM ID for external lifecycle management. */
-  get vmId(): string | null {
-    return this.vm?.vmId ?? null;
-  }
-  private screencast: RemoteScreencastSession | null = null;
 
   // Track cursor position server-side so it persists across navigations
   private cursorX = 640;  // Start roughly center-screen
@@ -120,57 +130,124 @@ export class McpBrowserManager {
 
   /** Directory where Playwright saves the video recording (set by launchLocal). */
   videoDir: string | null = null;
+  /** Directory where Playwright MCP writes snapshot files in file output mode. */
+  private outputDir: string | null = null;
+  /** Get the Playwright MCP output directory path. */
+  getOutputDir(): string | null { return this.outputDir; }
+
+  /** The stdio transport for the local Playwright MCP process. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private transport: any = null;
 
   /**
-   * Connect to an already-running Playwright MCP SSE endpoint without creating
-   * a VM. Used when the caller (e.g. assrt-freestyle) has already provisioned
-   * a VM with Playwright MCP listening locally (e.g. http://localhost:3001/sse)
-   * and just wants assrt to drive that existing browser.
-   *
-   * The caller is responsible for the VM lifecycle; close() will NOT destroy it.
+   * Kill any orphan Chrome/Playwright processes that are using a given user-data-dir.
+   * This prevents multiple Chrome instances from fighting over the same profile
+   * when a previous assrt session crashed or timed out without cleanup.
    */
-  async launchExisting(sseUrl: string): Promise<void> {
-    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
-    const { SSEClientTransport } = await import(
-      "@modelcontextprotocol/sdk/client/sse.js"
-    );
+  static async killOrphanChromeProcesses(userDataDir: string): Promise<void> {
+    try {
+      const { execSync } = await import("child_process");
+      // Find all Chrome processes using this specific user-data-dir
+      const psOutput = execSync(
+        `ps aux | grep -E "user-data-dir.*${userDataDir.replace(/\//g, "\\/")}" | grep -v grep || true`,
+        { encoding: "utf-8", timeout: 5000 }
+      ).trim();
 
-    console.error(JSON.stringify({ event: "browser.mcp.connect_start", mode: "existing", sseUrl, ts: new Date().toISOString() }));
-    const tConn = Date.now();
-    const transport = new SSEClientTransport(new URL(sseUrl));
-    this.client = new Client(
-      { name: "assrt", version: "1.0.0" },
-      { capabilities: {} }
-    );
-    await this.client.connect(transport);
-    this.vmExternallyManaged = true;
-    console.error(JSON.stringify({ event: "browser.mcp.connected", mode: "existing", durationMs: Date.now() - tConn, ts: new Date().toISOString() }));
-  }
+      if (!psOutput) return;
 
-  /** Launch browser in a remote Freestyle VM (production). */
-  async launch(): Promise<void> {
-    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
-    const { SSEClientTransport } = await import(
-      "@modelcontextprotocol/sdk/client/sse.js"
-    );
+      const pids: number[] = [];
+      for (const line of psOutput.split("\n")) {
+        const parts = line.trim().split(/\s+/);
+        const pid = parseInt(parts[1], 10);
+        if (pid && !isNaN(pid)) pids.push(pid);
+      }
 
-    this.vm = await createTestVm();
-    console.error(JSON.stringify({ event: "browser.mcp.connect_start", vmId: this.vm.vmId, sseUrl: this.vm.sseUrl, ts: new Date().toISOString() }));
-    const tConn = Date.now();
-    const transport = new SSEClientTransport(new URL(this.vm.sseUrl));
-    this.client = new Client(
-      { name: "assrt", version: "1.0.0" },
-      { capabilities: {} }
-    );
-    await this.client.connect(transport);
-    console.error(JSON.stringify({ event: "browser.mcp.connected", vmId: this.vm.vmId, durationMs: Date.now() - tConn, ts: new Date().toISOString() }));
+      if (pids.length === 0) return;
+
+      console.error(`[browser] found ${pids.length} orphan Chrome process(es) using ${userDataDir}: ${pids.join(", ")}`);
+
+      // Also find any Playwright MCP parent processes that spawned these Chrome instances
+      for (const chromePid of [...pids]) {
+        try {
+          const ppidOut = execSync(`ps -o ppid= -p ${chromePid}`, { encoding: "utf-8", timeout: 3000 }).trim();
+          const ppid = parseInt(ppidOut, 10);
+          if (ppid && !isNaN(ppid) && ppid > 1) {
+            // Check if the parent is a playwright-mcp process
+            const parentCmd = execSync(`ps -o command= -p ${ppid}`, { encoding: "utf-8", timeout: 3000 }).trim();
+            if (parentCmd.includes("playwright") && !pids.includes(ppid)) {
+              pids.push(ppid);
+              console.error(`[browser] also killing Playwright MCP parent (pid=${ppid})`);
+            }
+          }
+        } catch { /* parent may already be gone */ }
+      }
+
+      // Kill all orphan processes
+      for (const pid of pids) {
+        try {
+          process.kill(pid, "SIGKILL");
+          console.error(`[browser] killed orphan process pid=${pid}`);
+        } catch { /* already dead */ }
+      }
+
+      // Brief pause to let OS release file locks
+      await new Promise((r) => setTimeout(r, 500));
+    } catch (err) {
+      console.error(`[browser] orphan cleanup error (non-fatal):`, err);
+    }
   }
 
   /** Launch browser locally via Playwright MCP over stdio (CLI mode).
    *  @param videoDir — Optional directory for Playwright video recording. If provided, a config
    *  file is written with recordVideo enabled and passed to the MCP server via --config.
-   *  @param headed — When true, launch a visible browser window. Defaults to headless. */
-  async launchLocal(videoDir?: string, headed?: boolean): Promise<void> {
+   *  @param headed — When true, launch a visible browser window. Defaults to headless.
+   *  @param isolated — When true, keep browser profile in memory only (no disk persistence).
+   *  When false (default), persist the browser profile to ~/.assrt/browser-profile so cookies,
+   *  localStorage, and logins survive across test runs. */
+  /** Saved extension token file path. */
+  private static readonly EXTENSION_TOKEN_PATH = ".assrt/extension-token";
+
+  /** Resolve the extension token from (in priority order): parameter, env var, saved file.
+   *  Returns null if none found. Saves new tokens to disk for future use. */
+  private async resolveExtensionToken(tokenParam?: string): Promise<string | null> {
+    const { homedir } = await import("os");
+    const { join } = await import("path");
+    const tokenPath = join(homedir(), McpBrowserManager.EXTENSION_TOKEN_PATH);
+
+    // 1. Explicit parameter (highest priority)
+    if (tokenParam) {
+      // Save for future use
+      const { mkdirSync, writeFileSync } = await import("fs");
+      mkdirSync(join(homedir(), ".assrt"), { recursive: true });
+      writeFileSync(tokenPath, tokenParam.trim());
+      console.error("[browser] extension token saved to ~/.assrt/extension-token");
+      return tokenParam.trim();
+    }
+
+    // 2. Environment variable
+    const envToken = process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN;
+    if (envToken) return envToken.trim();
+
+    // 3. Saved file
+    try {
+      const { readFileSync } = await import("fs");
+      const saved = readFileSync(tokenPath, "utf-8").trim();
+      if (saved) return saved;
+    } catch { /* file doesn't exist */ }
+
+    return null;
+  }
+
+  /** @returns true if an existing browser was reused, false if a new one was launched. */
+  async launchLocal(videoDir?: string, headed?: boolean, isolated?: boolean, extension?: boolean, extensionToken?: string): Promise<boolean> {
+    // Reuse existing browser connection if still alive
+    if (this.client) {
+      console.error("[browser] reusing existing browser connection");
+      // Update videoDir for this run if provided
+      if (videoDir) this.videoDir = videoDir;
+      return true;
+    }
+
     const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
     const { StdioClientTransport } = await import(
       "@modelcontextprotocol/sdk/client/stdio.js"
@@ -178,7 +255,7 @@ export class McpBrowserManager {
 
     // cli.js isn't in package exports; resolve the package dir at runtime
     const { dirname, join } = await import("path");
-    const { tmpdir } = await import("os");
+    const { tmpdir, homedir } = await import("os");
     const { createRequire } = await import("module");
     const require_ = createRequire(import.meta.url);
     const pkgDir = dirname(require_.resolve("@playwright/mcp/package.json"));
@@ -186,83 +263,103 @@ export class McpBrowserManager {
     console.error("[browser] spawning local Playwright MCP via stdio");
     const tConn = Date.now();
 
-    // Use an isolated user-data-dir so assrt's browser doesn't conflict with
-    // any other Playwright MCP instance (e.g., the user's Claude Code session)
-    const userDataDir = join(tmpdir(), `assrt-browser-${Date.now()}`);
-    const args = [cliPath, "--viewport-size", "1600x900", "--user-data-dir", userDataDir];
-    if (!headed) args.splice(1, 0, "--headless");
-    console.error(`[browser] launch mode: ${headed ? "headed" : "headless"}`);
+    // Output snapshots to files to avoid blowing up the MCP transport with huge
+    // accessibility trees (e.g. Wikipedia). The agent reads truncated content.
+    const outputDir = join(homedir(), ".assrt", "playwright-output");
+    const { mkdirSync } = await import("fs");
+    mkdirSync(outputDir, { recursive: true });
+    this.outputDir = outputDir;
 
-    // If videoDir is provided, write a temp config file enabling Playwright video recording
-    if (videoDir) {
-      const { mkdirSync, writeFileSync } = await import("fs");
-      mkdirSync(videoDir, { recursive: true });
-      const config = {
-        browser: {
-          contextOptions: {
-            recordVideo: {
-              dir: videoDir,
-              size: { width: 1600, height: 900 },
-            },
-          },
-        },
-      };
-      const configPath = join(tmpdir(), `assrt-pw-config-${Date.now()}.json`);
-      writeFileSync(configPath, JSON.stringify(config));
-      args.push("--config", configPath);
-      this.videoDir = videoDir;
-      console.error(`[browser] video recording enabled → ${videoDir}`);
+    const args = [cliPath, "--viewport-size", "1600x900", "--output-mode", "file", "--output-dir", outputDir, "--caps", "devtools"];
+    // Extension token resolution (needed before spawning)
+    let resolvedExtensionToken: string | null = null;
+    if (extension) {
+      resolvedExtensionToken = await this.resolveExtensionToken(extensionToken);
+      if (!resolvedExtensionToken) {
+        throw new ExtensionTokenRequired();
+      }
+      // Extension mode connects to an existing Chrome; skip profile/headless flags
+      args.push("--extension");
+      console.error("[browser] launch mode: extension (connecting to existing Chrome)");
+    } else if (isolated) {
+      args.push("--isolated");
+      console.error("[browser] profile mode: isolated (in-memory, no persistence)");
+    } else {
+      const { lstatSync, unlinkSync, readlinkSync, writeFileSync } = await import("fs");
+      const { execSync } = await import("child_process");
+      const userDataDir = join(homedir(), ".assrt", "browser-profile");
+      mkdirSync(userDataDir, { recursive: true });
+
+      // Kill any orphan Chrome processes using this profile before launching.
+      // Without this, removing SingletonLock while Chrome is still running causes
+      // multiple Chrome instances to fight over the same user-data-dir.
+      await McpBrowserManager.killOrphanChromeProcesses(userDataDir);
+
+      // Clean up Chromium singleton/lock files that block concurrent profile access.
+      // SingletonLock is a symlink (target: "hostname-PID"), so we must use lstatSync
+      // (existsSync follows symlinks and returns false for the broken target path).
+      // Also clean SingletonSocket and SingletonCookie which can cause "Opening in
+      // existing browser session" errors when a previous browser exited uncleanly.
+      const singletonFiles = ["SingletonLock", "SingletonSocket", "SingletonCookie"];
+      for (const name of singletonFiles) {
+        const lockPath = join(userDataDir, name);
+        let hasLock = false;
+        try { lstatSync(lockPath); hasLock = true; } catch { /* no lock */ }
+        if (hasLock) {
+          try {
+            unlinkSync(lockPath);
+            console.error(`[browser] removed stale ${name} from browser profile`);
+          } catch {
+            console.error(`[browser] could not remove ${name}, falling back to isolated mode`);
+            args.push("--isolated");
+            isolated = true;
+            break;
+          }
+        }
+      }
+      if (!isolated) {
+        args.push("--user-data-dir", userDataDir);
+        console.error(`[browser] profile mode: persistent (${userDataDir})`);
+      }
+    }
+    if (!extension) {
+      if (!headed) args.splice(1, 0, "--headless");
+      console.error(`[browser] launch mode: ${headed ? "headed" : "headless"}`);
     }
 
-    const transport = new StdioClientTransport({
+    // Video recording is now managed per-run via startVideo/stopVideo (devtools capability)
+    // instead of context-level recordVideo config, so it works with persistent browser sessions.
+    if (videoDir) {
+      this.videoDir = videoDir;
+    }
+
+    const transportEnv = resolvedExtensionToken
+      ? { ...process.env, PLAYWRIGHT_MCP_EXTENSION_TOKEN: resolvedExtensionToken }
+      : undefined;
+    this.transport = new StdioClientTransport({
       command: process.execPath,
       args,
       stderr: "pipe",
+      ...(transportEnv && { env: transportEnv }),
     });
 
     this.client = new Client(
       { name: "assrt", version: "1.0.0" },
       { capabilities: {} }
     );
-    await this.client.connect(transport);
+    await this.client.connect(this.transport);
     console.error(
       `[browser] local MCP connected in ${((Date.now() - tConn) / 1000).toFixed(1)}s`
     );
+    return false;
   }
 
-  // ── CDP Screencast lifecycle ──
+  /** Per-call timeout for MCP tool requests (overrides the SDK's 60s default). */
+  private static readonly TOOL_TIMEOUT_MS = 120_000;
 
-  /**
-   * Start streaming JPEG frames from the remote browser via CDP screencast.
-   * Connects to the in-VM proxy's /screencast WebSocket endpoint on port 443.
-   * Should be called after the first navigation so a page target exists.
-   */
-  async startScreencast(onFrame: (jpeg: Buffer) => void): Promise<void> {
-    if (this.screencast || !this.vm) return;
-
-    this.screencast = new RemoteScreencastSession(this.vm.screencastUrl, onFrame);
-    try {
-      await this.screencast.start();
-    } catch (err) {
-      console.warn("[browser] screencast start failed, falling back to SSE screenshots:", (err as Error).message);
-      this.screencast = null;
-    }
-  }
-
-  /** Stop the screencast stream. */
-  async stopScreencast(): Promise<void> {
-    if (this.screencast) {
-      await this.screencast.stop();
-      this.screencast = null;
-    }
-  }
-
-  /** Whether the screencast is currently active. */
-  get isScreencasting(): boolean {
-    return this.screencast !== null;
-  }
-
-  /** Call a Playwright MCP tool by name. */
+  /** Call a Playwright MCP tool by name.
+   *  Uses a 120s timeout (vs the SDK's 60s default) to give slow navigations room,
+   *  and detects connection failures so callers can trigger reconnection. */
   private async callTool(
     name: string,
     args: Record<string, unknown> = {}
@@ -278,18 +375,25 @@ export class McpBrowserManager {
             ? ` el=${JSON.stringify((args as { element?: string }).element).slice(0, 40)}`
             : "";
     try {
-      const result = (await this.client.callTool({
-        name,
-        arguments: args,
-      })) as McpToolResult;
+      const result = (await this.client.callTool(
+        { name, arguments: args },
+        undefined,
+        { timeout: McpBrowserManager.TOOL_TIMEOUT_MS }
+      )) as McpToolResult;
       const dt = Date.now() - t;
       const err = result.isError ? " ERROR" : "";
       console.error(`[mcp] ${name}${argSummary} (${dt}ms)${err}`);
       return result;
     } catch (e) {
-      console.error(
-        `[mcp] ${name}${argSummary} THREW after ${Date.now() - t}ms: ${(e as Error).message}`
-      );
+      const msg = (e as Error).message ?? "";
+      const dt = Date.now() - t;
+      console.error(`[mcp] ${name}${argSummary} THREW after ${dt}ms: ${msg}`);
+      // Mark the client as dead on timeout or transport errors so isConnected reflects reality
+      if (msg.includes("Request timed out") || msg.includes("-32001") || msg.includes("EPIPE") || msg.includes("not connected")) {
+        console.error("[browser] marking client as dead after transport/timeout error");
+        this.client = null;
+        this.transport = null;
+      }
       throw e;
     }
   }
@@ -389,12 +493,50 @@ export class McpBrowserManager {
     const result = await this.callTool("browser_navigate", { url });
     // Re-inject overlay after navigation (new page clears DOM)
     await this.injectOverlay();
-    return extractText(result);
+    return this.resolveAndTruncate(extractText(result));
+  }
+
+  /** Max characters for a snapshot before truncation (roughly ~30k tokens). */
+  private static readonly SNAPSHOT_MAX_CHARS = 120_000;
+
+  /**
+   * Resolve file references in Playwright MCP output (file output mode) and
+   * truncate large snapshots to avoid blowing up the agent's context window.
+   */
+  private async resolveAndTruncate(text: string): Promise<string> {
+    // In file output mode, Playwright MCP returns a reference to a .yml file.
+    // Read the file content so the agent has the actual accessibility tree.
+    if (this.outputDir && text.includes(".yml")) {
+      const match = text.match(/([^\s"]+\.yml)/);
+      if (match) {
+        const filePath = match[1];
+        const { readFileSync } = await import("fs");
+        const { resolve } = await import("path");
+        const fullPath = filePath.startsWith("/") ? filePath : resolve(this.outputDir, filePath);
+        try {
+          text = readFileSync(fullPath, "utf-8");
+        } catch {
+          // Fall back to whatever text the MCP returned
+        }
+      }
+    }
+
+    // Truncate massive snapshots (e.g. Wikipedia) to prevent context overflow
+    if (text.length > McpBrowserManager.SNAPSHOT_MAX_CHARS) {
+      const originalLen = text.length;
+      const truncated = text.slice(0, McpBrowserManager.SNAPSHOT_MAX_CHARS);
+      const lineBreak = truncated.lastIndexOf("\n");
+      text = (lineBreak > 0 ? truncated.slice(0, lineBreak) : truncated)
+        + `\n\n[Snapshot truncated: showing ${(McpBrowserManager.SNAPSHOT_MAX_CHARS / 1000).toFixed(0)}k of ${(originalLen / 1000).toFixed(0)}k chars. Use element refs visible above to interact.]`;
+      console.error(`[browser] snapshot truncated: ${McpBrowserManager.SNAPSHOT_MAX_CHARS} chars (original: ${originalLen})`);
+    }
+
+    return text;
   }
 
   async snapshot(): Promise<string> {
     const result = await this.callTool("browser_snapshot");
-    return extractText(result);
+    return this.resolveAndTruncate(extractText(result));
   }
 
   async click(element: string, ref?: string): Promise<string> {
@@ -404,7 +546,7 @@ export class McpBrowserManager {
     const args: Record<string, unknown> = { element };
     if (ref) args.ref = ref;
     const result = await this.callTool("browser_click", args);
-    return extractText(result);
+    return this.resolveAndTruncate(extractText(result));
   }
 
   async type(element: string, text: string, ref?: string): Promise<string> {
@@ -414,7 +556,7 @@ export class McpBrowserManager {
     const args: Record<string, unknown> = { element, text };
     if (ref) args.ref = ref;
     const result = await this.callTool("browser_type", args);
-    return extractText(result);
+    return this.resolveAndTruncate(extractText(result));
   }
 
   async selectOption(element: string, values: string[]): Promise<string> {
@@ -424,15 +566,59 @@ export class McpBrowserManager {
       element,
       values,
     });
-    return extractText(result);
+    return this.resolveAndTruncate(extractText(result));
+  }
+
+  /** Resize the browser viewport. */
+  async resize(width: number, height: number): Promise<void> {
+    await this.callTool("browser_resize", { width, height });
   }
 
   async screenshot(): Promise<string | null> {
     const result = await this.callTool("browser_take_screenshot", { type: "jpeg", quality: 50 });
+    // In normal mode, the result contains inline base64 image data
     for (const content of result.content || []) {
       if (content.type === "image") return content.data || null;
     }
+    // In file output mode, the result contains a text reference to a .jpeg file
+    if (this.outputDir) {
+      const text = extractText(result);
+      const match = text.match(/([^\s"]+\.(?:jpeg|jpg|png))/i);
+      if (match) {
+        const filePath = match[1];
+        const { readFileSync } = await import("fs");
+        const { resolve } = await import("path");
+        const fullPath = filePath.startsWith("/") ? filePath : resolve(this.outputDir, filePath);
+        try {
+          return readFileSync(fullPath).toString("base64");
+        } catch {
+          // File not found, fall through
+        }
+      }
+    }
     return null;
+  }
+
+  /** Start video recording (requires --caps devtools). */
+  async startVideo(filename?: string): Promise<void> {
+    try {
+      const args: Record<string, unknown> = { size: { width: 1600, height: 900 } };
+      if (filename) args.filename = filename;
+      await this.callTool("browser_start_video", args);
+      console.error(`[browser] video recording started${filename ? `: ${filename}` : ""}`);
+    } catch (err) {
+      console.error(`[browser] failed to start video: ${(err as Error).message}`);
+    }
+  }
+
+  /** Stop video recording and finalize the file. */
+  async stopVideo(): Promise<void> {
+    try {
+      await this.callTool("browser_stop_video", {});
+      console.error("[browser] video recording stopped");
+    } catch (err) {
+      console.error(`[browser] failed to stop video: ${(err as Error).message}`);
+    }
   }
 
   async pressKey(key: string): Promise<string> {
@@ -460,52 +646,30 @@ export class McpBrowserManager {
     return extractText(result);
   }
 
-  /** Trigger ffmpeg encoding of captured screencast frames on the VM. */
-  async encodeVideo(): Promise<boolean> {
-    if (!this.vm) return false;
-    const host = this.vm.sseUrl.replace(/\/sse$/, "").replace(/^https?:\/\//, "");
-    const encodeUrl = `https://${host}/video/encode`;
-    console.error(`[browser] triggering video encode at ${encodeUrl}`);
-    try {
-      const resp = await fetch(encodeUrl, { method: "POST" });
-      if (!resp.ok) {
-        const text = await resp.text();
-        console.error(`[browser] video encode failed: ${resp.status} ${text}`);
-        return false;
+  async close(opts?: { keepBrowserOpen?: boolean }): Promise<void> {
+    if (opts?.keepBrowserOpen) {
+      console.error("[browser] keepBrowserOpen=true — leaving browser running");
+      // Detach the child process so it survives our exit, then drop references
+      // without calling client.close() (which sends SIGTERM to the process).
+      if (this.transport) {
+        try {
+          const pid = this.transport.pid;
+          // Access the internal child process and unref it so Node won't wait for it
+          if (this.transport._process) {
+            this.transport._process.unref();
+            this.transport._process.stdin?.unref?.();
+            this.transport._process.stdout?.unref?.();
+            this.transport._process.stderr?.unref?.();
+            // Prevent the transport from killing the process on close
+            this.transport._process = undefined;
+          }
+          console.error(`[browser] detached Playwright MCP process (pid=${pid})`);
+        } catch { /* best effort */ }
+        this.transport = null;
       }
-      const result = (await resp.json()) as { frames?: number; sizeBytes?: number };
-      console.error(`[browser] video encoded: ${result.frames} frames, ${result.sizeBytes} bytes`);
-      return true;
-    } catch (err) {
-      console.error(`[browser] video encode error:`, err);
-      return false;
+      this.client = null;
+      return;
     }
-  }
-
-  /** Download the encoded video from the remote VM. Call encodeVideo() first. */
-  async getVideoBuffer(): Promise<Buffer | null> {
-    if (!this.vm) return null;
-    const host = this.vm.sseUrl.replace(/\/sse$/, "").replace(/^https?:\/\//, "");
-    const videoUrl = `https://${host}/video`;
-    console.error(`[browser] downloading video from ${videoUrl}`);
-    try {
-      const resp = await fetch(videoUrl);
-      if (!resp.ok) {
-        console.error(`[browser] video download failed: ${resp.status}`);
-        return null;
-      }
-      const arrayBuf = await resp.arrayBuffer();
-      console.error(`[browser] video downloaded: ${arrayBuf.byteLength} bytes`);
-      return Buffer.from(arrayBuf);
-    } catch (err) {
-      console.error(`[browser] video download error:`, err);
-      return null;
-    }
-  }
-
-  async close(opts?: { skipVmDestroy?: boolean }): Promise<void> {
-    // Stop screencast first
-    await this.stopScreencast();
 
     if (this.client) {
       try {
@@ -519,30 +683,6 @@ export class McpBrowserManager {
         /* */
       }
       this.client = null;
-    }
-    if (this.vmExternallyManaged) {
-      // VM is owned by the caller — do not destroy it.
-      return;
-    }
-    if (this.vm && !opts?.skipVmDestroy) {
-      const vmId = this.vm.vmId;
-      this.vm = null;
-      console.error(`[browser] close() → destroying VM ${vmId}`);
-      destroyTestVm(vmId).catch((err) =>
-        console.error(`[browser] failed to destroy VM ${vmId}:`, err)
-      );
-    }
-  }
-
-  /** Destroy the VM. Call after getVideoBuffer() if you used skipVmDestroy. */
-  async destroyVm(): Promise<void> {
-    if (this.vm) {
-      const vmId = this.vm.vmId;
-      this.vm = null;
-      console.error(`[browser] destroyVm() → destroying VM ${vmId}`);
-      destroyTestVm(vmId).catch((err) =>
-        console.error(`[browser] failed to destroy VM ${vmId}:`, err)
-      );
     }
   }
 }
