@@ -11,7 +11,7 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 
-const CENTRAL_API_URL = process.env.ASSRT_API_URL || "https://assrt.ai";
+const CENTRAL_API_URL = process.env.ASSRT_API_URL || "https://app.assrt.ai";
 const LOCAL_DIR = join(homedir(), ".assrt", "scenarios");
 
 interface StoredScenario {
@@ -19,6 +19,9 @@ interface StoredScenario {
   plan: string;
   name?: string;
   url?: string;
+  passCriteria?: string;
+  variables?: Record<string, string>;
+  tags?: string[];
   createdAt?: string;
   updatedAt?: string;
 }
@@ -75,6 +78,9 @@ export async function fetchScenario(scenarioId: string): Promise<StoredScenario 
       plan: data.plan,
       name: data.name,
       url: data.url,
+      passCriteria: data.passCriteria,
+      variables: data.variables,
+      tags: data.tags,
       createdAt: data.createdAt,
       updatedAt: data.updatedAt,
     };
@@ -94,6 +100,9 @@ export async function saveScenario(data: {
   plan: string;
   name?: string;
   url?: string;
+  passCriteria?: string;
+  variables?: Record<string, string>;
+  tags?: string[];
   createdFrom?: "mcp" | "webapp" | "cli";
 }): Promise<string> {
   try {
@@ -108,14 +117,14 @@ export async function saveScenario(data: {
       throw new Error(`HTTP ${res.status}: ${errBody}`);
     }
     const result = await res.json() as { id: string; createdAt?: string };
-    writeLocal({ id: result.id, plan: data.plan, name: data.name, url: data.url, createdAt: result.createdAt });
+    writeLocal({ id: result.id, plan: data.plan, name: data.name, url: data.url, passCriteria: data.passCriteria, variables: data.variables, tags: data.tags, createdAt: result.createdAt });
     return result.id;
   } catch (err) {
     console.error("[scenario-store] Central save failed:", (err as Error).message);
     // Generate a local-only ID with a prefix so we know it's unsynced
     const crypto = await import("crypto");
     const localId = `local-${crypto.randomUUID()}`;
-    writeLocal({ id: localId, plan: data.plan, name: data.name, url: data.url });
+    writeLocal({ id: localId, plan: data.plan, name: data.name, url: data.url, passCriteria: data.passCriteria, variables: data.variables, tags: data.tags });
     return localId;
   }
 }
@@ -125,7 +134,7 @@ export async function saveScenario(data: {
  */
 export async function updateScenario(
   scenarioId: string,
-  data: { plan?: string; name?: string; url?: string }
+  data: { plan?: string; name?: string; url?: string; passCriteria?: string; variables?: Record<string, string>; tags?: string[] }
 ): Promise<boolean> {
   try {
     const res = await fetch(`${CENTRAL_API_URL}/api/public/scenarios/${scenarioId}`, {
