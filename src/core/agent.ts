@@ -2,7 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { GoogleGenAI, Type } from "@google/genai";
 import { McpBrowserManager } from "./browser";
 import { DisposableEmail } from "./email";
-import type { TestStep, TestAssertion, ScenarioResult, TestReport } from "./types";
+import type { TestStep, TestAssertion, ScenarioResult, TestReport, TestRunOptions } from "./types";
 
 const MAX_STEPS_PER_SCENARIO = Infinity;
 const MAX_CONVERSATION_TURNS = Infinity;
@@ -300,7 +300,7 @@ const GEMINI_FUNCTION_DECLARATIONS = TOOLS.map((t) => ({
   },
 }));
 
-export type AgentMode = "local" | "remote" | "existing";
+export type AgentMode = "local";
 
 export class TestAgent {
   private anthropic: Anthropic | null = null;
@@ -322,8 +322,7 @@ export class TestAgent {
    *   When provided, replaces the old 1.5s screenshot polling with continuous
    *   ~15fps streaming. When absent (e.g., plan generation), falls back to
    *   SSE screenshot emits.
-   * @param mode — "local" spawns a local Playwright MCP over stdio,
-   *   "remote" (default) uses a Freestyle VM.
+   * @param mode — "local" spawns a local Playwright MCP over stdio.
    */
   /**
    * @param authType — "apiKey" for regular API keys (X-Api-Key header),
@@ -333,15 +332,24 @@ export class TestAgent {
   private videoDir: string | null = null;
   /** When true, launches a headed (visible) browser in local mode. */
   private headed = false;
+  /** When true, browser profile is in-memory only (no disk persistence). */
+  private isolated = false;
+  /** When true, connect to an existing Chrome instance via Playwright's --extension flag. */
+  private extension = false;
+  /** Token for Playwright extension mode (bypasses Chrome approval dialog). */
+  private extensionToken?: string;
 
-  constructor(apiKey: string, emit: EmitFn, model?: string, provider?: string, broadcastFrame?: ((jpeg: Buffer) => void) | null, mode?: AgentMode, authType?: "apiKey" | "oauth", videoDir?: string, headed?: boolean) {
+  constructor(apiKey: string, emit: EmitFn, model?: string, provider?: string, broadcastFrame?: ((jpeg: Buffer) => void) | null, mode?: AgentMode, authType?: "apiKey" | "oauth", videoDir?: string, headed?: boolean, isolated?: boolean, browser?: McpBrowserManager, extension?: boolean, extensionToken?: string) {
     this.provider = (provider === "gemini" ? "gemini" : "anthropic") as Provider;
-    this.browser = new McpBrowserManager();
+    this.browser = browser || new McpBrowserManager();
     this.emit = emit;
     this.broadcastFrame = broadcastFrame || null;
-    this.mode = mode || "remote";
+    this.mode = "local";
     this.videoDir = videoDir || null;
     this.headed = !!headed;
+    this.isolated = !!isolated;
+    this.extension = !!extension;
+    this.extensionToken = extensionToken;
 
     if (this.provider === "gemini") {
       this.gemini = new GoogleGenAI({ apiKey });
@@ -359,26 +367,39 @@ export class TestAgent {
     }
   }
 
-  async run(url: string, scenariosText: string): Promise<TestReport> {
+  async run(url: string, scenariosText: string, options?: TestRunOptions): Promise<TestReport> {
     const startTime = Date.now();
-    console.error(JSON.stringify({ event: "agent.run.start", url, mode: this.mode, model: this.model, ts: new Date().toISOString() }));
-    if (this.mode === "local") {
-      this.emit("status", { message: "Launching local browser..." });
-      await this.browser.launchLocal(this.videoDir || undefined, this.headed);
-    } else if (this.mode === "existing") {
-      const sseUrl = process.env.ASSRT_PLAYWRIGHT_SSE_URL;
-      if (!sseUrl) {
-        throw new Error("mode=existing requires ASSRT_PLAYWRIGHT_SSE_URL env var");
+    const passCriteria = options?.passCriteria;
+    const variables = options?.variables;
+    const viewport = options?.viewport;
+
+    // Interpolate variables into plan text: {{VAR_NAME}} -> value
+    if (variables && Object.keys(variables).length > 0) {
+      for (const [key, value] of Object.entries(variables)) {
+        scenariosText = scenariosText.replace(new RegExp(`\\{\\{${key}\\}\\}`, "g"), value);
       }
-      this.emit("status", { message: `Connecting to existing Playwright MCP at ${sseUrl}...` });
-      await this.browser.launchExisting(sseUrl);
-    } else {
-      this.emit("status", { message: "Provisioning cloud browser VM..." });
-      await this.browser.launch();
     }
+
+    console.error(JSON.stringify({ event: "agent.run.start", url, mode: this.mode, model: this.model, hasPassCriteria: !!passCriteria, variableCount: variables ? Object.keys(variables).length : 0, ts: new Date().toISOString() }));
+    let browserReused = false;
+    this.emit("status", { message: this.extension ? "Connecting to existing Chrome..." : "Launching local browser..." });
+    browserReused = await this.browser.launchLocal(this.videoDir || undefined, this.headed, this.isolated, this.extension, this.extensionToken);
     const launchMs = Date.now() - startTime;
     console.error(JSON.stringify({ event: "agent.browser.launched", durationMs: launchMs, ts: new Date().toISOString() }));
     this.emit("status", { message: "Browser launched via Playwright MCP" });
+
+    // Apply custom viewport if specified
+    if (viewport) {
+      const VIEWPORT_PRESETS: Record<string, { width: number; height: number }> = {
+        mobile: { width: 375, height: 812 },
+        desktop: { width: 1440, height: 900 },
+      };
+      const dims = typeof viewport === "string" ? VIEWPORT_PRESETS[viewport.toLowerCase()] : viewport;
+      if (dims) {
+        await this.browser.resize(dims.width, dims.height);
+        this.emit("status", { message: `Viewport set to ${dims.width}x${dims.height}` });
+      }
+    }
 
     // Send the screencast WebSocket URL so the client can connect directly
     const screencastUrl = this.browser.screencastUrl;
@@ -404,12 +425,18 @@ export class TestAgent {
       this.emit("vm_id", { vmId });
     }
 
-    const tNav = Date.now();
-    await this.browser.navigate(url);
-    console.error(JSON.stringify({ event: "agent.navigate.done", url, durationMs: Date.now() - tNav, ts: new Date().toISOString() }));
-    this.emit("status", { message: `Navigated to ${url}` });
-
-    this.queueDiscoverPage(url);
+    // When reusing an existing browser session, skip the initial navigation
+    // so the agent continues from the current page state.
+    if (!browserReused) {
+      const tNav = Date.now();
+      await this.browser.navigate(url);
+      console.error(JSON.stringify({ event: "agent.navigate.done", url, durationMs: Date.now() - tNav, ts: new Date().toISOString() }));
+      this.emit("status", { message: `Navigated to ${url}` });
+      this.queueDiscoverPage(url);
+    } else {
+      console.error(JSON.stringify({ event: "agent.browser.reused", url, ts: new Date().toISOString() }));
+      this.emit("status", { message: "Continuing in existing browser session" });
+    }
 
     const scenarios = this.parseScenarios(scenariosText);
     const results: ScenarioResult[] = [];
@@ -422,7 +449,10 @@ export class TestAgent {
         try {
           const result = await this.runScenario(
             url, scenario.name, scenario.steps, i === 0,
-            results.map((r) => `${r.name}: ${r.passed ? "PASSED" : "FAILED"} — ${r.summary}`)
+            results.map((r) => `${r.name}: ${r.passed ? "PASSED" : "FAILED"} — ${r.summary}`),
+            browserReused,
+            passCriteria,
+            variables,
           );
           results.push(result);
           this.emit("scenario_complete", { index: i, name: scenario.name, passed: result.passed, summary: result.summary });
@@ -439,9 +469,8 @@ export class TestAgent {
         }
       }
     } finally {
-      // Don't close the browser here — keep the VM alive so the user can
-      // take over and interact after the test finishes. The VM will be
-      // released explicitly via /api/release-vm or by Freestyle's idle timeout.
+      // Don't close the browser here — keep it alive so the user can
+      // take over and interact after the test finishes.
     }
 
     const report: TestReport = {
@@ -455,24 +484,10 @@ export class TestAgent {
     return report;
   }
 
-  /** Encode and download the screencast recording from the VM.
-   *  Does NOT destroy the VM (it stays alive for user takeover). */
-  async finalizeVideo(): Promise<Buffer | null> {
-    try {
-      // Trigger ffmpeg encoding of accumulated screencast frames
-      const encoded = await this.browser.encodeVideo();
-      if (!encoded) return null;
-      // Download the encoded mp4
-      return await this.browser.getVideoBuffer();
-    } catch (err) {
-      console.error("[agent] finalizeVideo error:", err);
-      return null;
-    }
-  }
-
-  /** Close the browser. For local mode this finalizes the video recording. */
-  async close(): Promise<void> {
-    try { await this.browser.close(); } catch { /* best effort */ }
+  /** Close the browser.
+   *  @param opts.keepBrowserOpen — When true, leave the browser window open after the test. */
+  async close(opts?: { keepBrowserOpen?: boolean }): Promise<void> {
+    try { await this.browser.close({ keepBrowserOpen: opts?.keepBrowserOpen }); } catch { /* best effort */ }
   }
 
   /* ── Continuous page discovery ── */
@@ -565,7 +580,10 @@ export class TestAgent {
 
   private async runScenario(
     baseUrl: string, scenarioName: string, scenarioSteps: string,
-    isFirstScenario: boolean, previousSummaries: string[]
+    isFirstScenario: boolean, previousSummaries: string[],
+    browserReused?: boolean,
+    passCriteria?: string,
+    variables?: Record<string, string>,
   ): Promise<ScenarioResult> {
     const startTime = Date.now();
     const steps: TestStep[] = [];
@@ -583,12 +601,6 @@ export class TestAgent {
       this.emit("screenshot", { base64: initialScreenshot });
     }
 
-    // Start CDP screencast for high-fps WebSocket streaming when available
-    // Skip in local mode: the user sees the headed browser directly
-    if (this.broadcastFrame && this.mode !== "local") {
-      await this.browser.startScreencast(this.broadcastFrame);
-    }
-
     // Screenshot polling removed: screenshots are now captured only after
     // visual actions (navigate, click, type, select, scroll, press_key)
     // to avoid duplicate/redundant captures that waste tokens and time.
@@ -596,13 +608,25 @@ export class TestAgent {
     let contextInfo = "";
     if (!isFirstScenario && previousSummaries.length > 0) {
       contextInfo = `\n\nPrevious Scenarios (browser state carries over):\n${previousSummaries.map((s, i) => `${i + 1}. ${s}`).join("\n")}`;
+    } else if (browserReused) {
+      contextInfo = `\nContinuing in an existing browser session. The browser is already open from a previous test run. The current page state is shown below. Do NOT navigate away unless the test scenario explicitly requires it.`;
     } else {
       contextInfo = `\nNavigated to: ${baseUrl}`;
     }
 
     const emailInfo = this.tempEmail ? `\nActive disposable email: ${this.tempEmail.address}` : "";
 
-    const userPrompt = `${contextInfo}${emailInfo}\n\nCurrent page accessibility tree:\n${initialSnapshot}\n\n---\nExecute this test scenario:\n**${scenarioName}**\n${scenarioSteps}\n\nIMPORTANT: Use snapshot refs (e.g. ref="e5") for reliable element targeting. Call snapshot before each interaction to get fresh refs.\nIf login/signup needs email, use create_temp_email first.\n\nAnalyze the page, act, make assertions, call complete_scenario when done.`;
+    // Build pass criteria section
+    const passCriteriaSection = passCriteria
+      ? `\n\n## Pass Criteria (MANDATORY)\nThe test MUST verify ALL of the following conditions. Mark the scenario as FAILED if any condition is not met:\n${passCriteria}`
+      : "";
+
+    // Build variables section (for reference; variables are already interpolated into plan text)
+    const variablesSection = variables && Object.keys(variables).length > 0
+      ? `\n\n## Test Variables\nThe following variables were substituted into the test plan:\n${Object.entries(variables).map(([k, v]) => `- {{${k}}} = "${v}"`).join("\n")}`
+      : "";
+
+    const userPrompt = `${contextInfo}${emailInfo}\n\nCurrent page accessibility tree:\n${initialSnapshot}\n\n---\nExecute this test scenario:\n**${scenarioName}**\n${scenarioSteps}${passCriteriaSection}${variablesSection}\n\nIMPORTANT: Use snapshot refs (e.g. ref="e5") for reliable element targeting. Call snapshot before each interaction to get fresh refs.\nIf login/signup needs email, use create_temp_email first.\n\nAnalyze the page, act, make assertions, call complete_scenario when done.`;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const messages: any[] = this.provider === "gemini"
