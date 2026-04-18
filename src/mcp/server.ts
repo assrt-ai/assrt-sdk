@@ -21,11 +21,14 @@ import { tmpdir } from "os";
 import { execSync } from "child_process";
 import { getCredential } from "../core/keychain";
 import { TestAgent } from "../core/agent";
-import { McpBrowserManager } from "../core/browser";
+import { McpBrowserManager, ExtensionTokenRequired } from "../core/browser";
 import { fetchScenario, saveScenario, updateScenario, saveScenarioRun, uploadArtifacts, buildCloudUrls } from "../core/scenario-store";
 import { writeScenarioFile, writeResultsFile, readScenarioFile, PATHS } from "../core/scenario-files";
 import type { TestReport } from "../core/types";
 import { trackEvent, shutdownTelemetry } from "../core/telemetry";
+
+// ── Singleton browser instance (reused across assrt_test calls) ──
+let sharedBrowser: McpBrowserManager | null = null;
 
 // ── Video player HTML generator ──
 
@@ -296,12 +299,31 @@ After \`assrt_test\` runs, the test plan is saved to \`/tmp/assrt/scenario.md\` 
 
 Every test run is auto-saved with a unique scenario ID (UUID). Use this ID to re-run the same scenario later: \`assrt_test({url, scenarioId: "..."})\`.
 
+## Extension mode (reuse existing Chrome)
+
+Pass \`extension: true\` to connect to the user's running Chrome (with their logins, cookies, tabs) instead of launching a new browser. On first use, if no token is saved, the response will contain setup instructions and an \`extension_token_required\` error. Ask the user to paste the token, then retry with \`extensionToken\` set. The token is saved automatically for future runs.
+
 ## Important
 
 - Always include the correct local dev server URL. Check package.json scripts or running processes to find it.
 - Test plans use \`#Case N: name\` format. Each case should be self-contained (3-5 steps).
 - The browser runs headless by default at 1600x900. Pass \`headed: true\` to \`assrt_test\` (or set \`ASSRT_HEADED=1\`) to launch a visible browser window, useful when debugging a failing test locally. Screenshots are returned as images in the response.
-- If the dev server is not running, start it first before calling assrt_test.`;
+- If the dev server is not running, start it first before calling assrt_test.
+
+## Non-blocking CLI alternative
+
+The MCP tools (\`assrt_test\`, \`assrt_plan\`) block the conversation until they finish. To run tests without blocking, use the \`assrt\` CLI via the Bash tool with \`run_in_background: true\`:
+
+\`\`\`bash
+npx assrt run --url http://localhost:3000 --extension --video --plan "#Case: Login flow
+- Navigate to the login page
+- Enter test credentials
+- Verify dashboard loads" --json
+\`\`\`
+
+Key flags: \`--video\` records a video and auto-opens the player, \`--no-auto-open\` records without opening, \`--extension\` reuses existing Chrome, \`--json\` outputs structured results (includes \`videoPlayerUrl\`).
+
+Use this when you want to continue working while tests run in the background.`;
 
 const server = new McpServer(
   { name: "assrt", version: "0.2.0" },
@@ -314,15 +336,38 @@ server.tool(
   "assrt_test",
   "Run AI-powered QA test scenarios against a URL. Returns a structured report with pass/fail results, assertions, and improvement suggestions.",
   {
-    url: z.string().describe("URL to test (e.g. http://localhost:3000)"),
+    url: z.string().optional().describe("URL to test (e.g. http://localhost:3000). Optional when continuing in an existing browser session."),
     plan: z.string().optional().describe("Test scenarios in text format. Use #Case N: format for multiple scenarios. Either plan or scenarioId is required."),
     scenarioId: z.string().optional().describe("Load a saved scenario by its UUID instead of providing plan text. Get this ID from a previous assrt_test run or the Assrt web app."),
     scenarioName: z.string().optional().describe("Human-readable name for saving this scenario (e.g. 'checkout flow'). Used when auto-saving new scenarios."),
+    passCriteria: z.string().optional().describe("Explicit pass/fail criteria the agent MUST verify. Free text describing success conditions (e.g. 'Cart total shows $42.99', 'User is redirected to /dashboard', 'Error toast does NOT appear'). The test fails if any criterion is not met."),
+    variables: z.record(z.string(), z.string()).optional().describe("Key/value pairs for parameterized tests. Variables are interpolated into the plan text as {{KEY}} and also shown to the agent. Example: {\"EMAIL\": \"test@example.com\", \"SKU\": \"PROD-001\"}"),
+    timeout: z.number().optional().describe("Maximum seconds before the test run is aborted (default: no limit). Useful for ensuring fast flows stay fast."),
+    viewport: z.union([
+      z.string().describe("Viewport preset: 'mobile' (375x812) or 'desktop' (1440x900)"),
+      z.object({ width: z.number(), height: z.number() }).describe("Explicit viewport dimensions"),
+    ]).optional().describe("Browser viewport size. Pass a preset string ('mobile', 'desktop') or explicit {width, height}."),
+    tags: z.array(z.string()).optional().describe("Tags for organizing scenarios (e.g. ['smoke', 'checkout', 'regression']). Saved with the scenario for filtering."),
     model: z.string().optional().describe("LLM model override (default: claude-haiku-4-5-20251001)"),
     autoOpenPlayer: z.boolean().optional().describe("Auto-open the video player in the browser when test completes (default: true)"),
     headed: z.boolean().optional().describe("Launch a visible (headed) browser window instead of headless. Defaults to headless, or the ASSRT_HEADED env var if set."),
+    isolated: z.boolean().optional().describe("When true, keep the browser profile in memory only (no disk persistence). When false (default), persist cookies, localStorage, and logins to ~/.assrt/browser-profile across test runs."),
+    keepBrowserOpen: z.boolean().optional().describe("When true, leave the browser window open after the test finishes instead of closing it. Useful for manual inspection or follow-up testing. Defaults to false."),
+    extension: z.boolean().optional().describe("When true, connect to your existing Chrome browser instance instead of launching a new one. Uses Playwright's --extension mode via Chrome DevTools Protocol."),
+    extensionToken: z.string().optional().describe("Playwright extension token for bypassing the Chrome approval dialog. Required on first use of extension mode. The token is saved automatically for future runs."),
   },
-  async ({ url, plan, scenarioId, scenarioName, model, autoOpenPlayer, headed }) => {
+  async ({ url: urlParam, plan, scenarioId, scenarioName, passCriteria: passCriteriaParam, variables: variablesParam, timeout, viewport, tags: tagsParam, model, autoOpenPlayer, headed, isolated, keepBrowserOpen, extension, extensionToken }) => {
+    // Mutable copies of scenario metadata (may be inherited from stored scenario)
+    let passCriteria = passCriteriaParam;
+    let variables = variablesParam as Record<string, string> | undefined;
+    let tags = tagsParam;
+
+    // If no URL provided, require an existing browser session to continue in
+    const url = urlParam || "";
+    if (!url && (!sharedBrowser || !sharedBrowser.isConnected)) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ error: "url is required when there is no existing browser session to continue." }) }] };
+    }
+
     // Resolve the plan: either from scenarioId or directly from plan param
     let resolvedPlan: string;
     let resolvedScenarioId = scenarioId;
@@ -337,6 +382,10 @@ server.tool(
         return { content: [{ type: "text" as const, text: JSON.stringify({ error: `Scenario ${scenarioId} not found.` }) }] };
       }
       resolvedPlan = stored.plan;
+      // Inherit stored scenario metadata when not explicitly overridden by the caller
+      if (!passCriteria && stored.passCriteria) passCriteria = stored.passCriteria;
+      if ((!variables || Object.keys(variables).length === 0) && stored.variables) variables = stored.variables;
+      if ((!tags || tags.length === 0) && stored.tags) tags = stored.tags;
       console.error(`[assrt_test] Loaded scenario ${scenarioId.slice(0, 8)}... (${stored.name || "unnamed"})`);
     } else if (plan) {
       resolvedPlan = plan;
@@ -362,6 +411,9 @@ server.tool(
           plan: resolvedPlan,
           name: scenarioName,
           url,
+          passCriteria,
+          variables,
+          tags,
           createdFrom: "mcp",
         });
         // Rewrite scenario file with real ID so fs.watch syncs correctly
@@ -444,17 +496,105 @@ server.tool(
 
     const t0 = Date.now();
     const videoDir = join(runDir, "video");
-    // Auto-select mode: if ASSRT_PLAYWRIGHT_SSE_URL is set (VM embedded mode),
-    // connect to the existing Playwright MCP rather than spawning a local one.
-    const agentMode: "local" | "existing" = process.env.ASSRT_PLAYWRIGHT_SSE_URL
-      ? "existing"
-      : "local";
+    const agentMode = "local" as const;
     const headedResolved = headed ?? (process.env.ASSRT_HEADED === "1" || process.env.ASSRT_HEADED === "true");
-    const agent = new TestAgent(credential.token, emit, model, "anthropic", null, agentMode, credential.type, videoDir, headedResolved);
-    const report: TestReport = await agent.run(url, resolvedPlan);
+    const isolatedResolved = isolated ?? (process.env.ASSRT_ISOLATED === "1" || process.env.ASSRT_ISOLATED === "true");
 
-    // Close the browser so Playwright finalizes the video recording
-    await agent.close();
+    // Reuse the shared browser only if it's alive (real health check, not just reference check).
+    // This prevents reusing a dead browser from a previous run that crashed or timed out.
+    if (agentMode === "local") {
+      if (sharedBrowser && sharedBrowser.isConnected) {
+        const alive = await sharedBrowser.isAlive();
+        if (!alive) {
+          console.error("[server] shared browser failed health check, closing and creating fresh instance");
+          try { await sharedBrowser.close(); } catch { /* best effort */ }
+          sharedBrowser = null;
+        }
+      }
+      if (!sharedBrowser || !sharedBrowser.isConnected) {
+        sharedBrowser = new McpBrowserManager();
+      }
+    }
+    const extensionResolved = extension ?? false;
+    const agent = new TestAgent(credential.token, emit, model, "anthropic", null, agentMode, credential.type, videoDir, headedResolved, isolatedResolved, agentMode === "local" ? sharedBrowser! : undefined, extensionResolved, extensionToken);
+
+    // Ensure the browser is launched before starting video recording.
+    // agent.run() calls launchLocal() internally, but we need the browser connected
+    // before calling startVideo, so pre-launch it here.
+    let videoFilesBefore: string[] = [];
+    if (agentMode === "local" && sharedBrowser && !sharedBrowser.isConnected) {
+      try {
+        await sharedBrowser.launchLocal(videoDir, headedResolved, isolatedResolved, extensionResolved, extensionToken);
+      } catch (err) {
+        if (err instanceof ExtensionTokenRequired) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({
+            error: "extension_token_required",
+            message: err.message,
+            hint: "Ask the user to paste the token, then call assrt_test again with extensionToken parameter set to the token value.",
+          }, null, 2) }] };
+        }
+        throw err;
+      }
+    }
+    // Start video recording for this run (uses devtools capability)
+    if (agentMode === "local" && sharedBrowser && sharedBrowser.isConnected) {
+      mkdirSync(videoDir, { recursive: true });
+      const playwrightOutputDir = sharedBrowser.getOutputDir();
+      if (playwrightOutputDir) {
+        try { videoFilesBefore = readdirSync(playwrightOutputDir).filter((f) => f.endsWith(".webm")); } catch { /* */ }
+      }
+      await sharedBrowser.startVideo();
+    }
+
+    // Build run options
+    const runOptions = { passCriteria, variables, timeout, viewport };
+
+    // Run with optional timeout
+    let report: TestReport;
+    if (timeout && timeout > 0) {
+      const timeoutMs = timeout * 1000;
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`Test run exceeded timeout of ${timeout}s`)), timeoutMs)
+      );
+      try {
+        report = await Promise.race([agent.run(url, resolvedPlan, runOptions), timeoutPromise]);
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        report = {
+          url,
+          scenarios: [{ name: "Timeout", passed: false, steps: [], assertions: [{ description: `Completed within ${timeout}s`, passed: false, evidence: errMsg }], summary: errMsg, duration: timeout * 1000 }],
+          totalDuration: timeout * 1000,
+          passedCount: 0,
+          failedCount: 1,
+          generatedAt: new Date().toISOString(),
+        };
+      }
+    } else {
+      report = await agent.run(url, resolvedPlan, runOptions);
+    }
+
+    // Stop video recording to finalize the file for this run
+    if (agentMode === "local" && sharedBrowser) {
+      await sharedBrowser.stopVideo();
+      // Find the newly created video file in the Playwright output dir and move it to our video dir
+      const playwrightOutputDir = sharedBrowser.getOutputDir();
+      if (playwrightOutputDir) {
+        try {
+          const { copyFileSync } = await import("fs");
+          const videoFilesAfter = readdirSync(playwrightOutputDir).filter((f) => f.endsWith(".webm"));
+          const newVideoFiles = videoFilesAfter.filter((f) => !videoFilesBefore.includes(f));
+          if (newVideoFiles.length > 0) {
+            const srcPath = join(playwrightOutputDir, newVideoFiles[0]);
+            const destPath = join(videoDir, "recording.webm");
+            copyFileSync(srcPath, destPath);
+            console.error(`[assrt_test] video copied: ${srcPath} -> ${destPath}`);
+          }
+        } catch (err) { console.error(`[assrt_test] video copy failed: ${(err as Error).message}`); }
+      }
+      console.error("[assrt_test] browser kept alive for reuse");
+    } else {
+      await agent.close({ keepBrowserOpen: !!keepBrowserOpen });
+    }
 
     // Write execution log to disk
     const logContent = logs.join("\n");
@@ -499,6 +639,11 @@ server.tool(
       passedCount: report.passedCount,
       failedCount: report.failedCount,
       duration: +(report.totalDuration / 1000).toFixed(1),
+      ...(passCriteria && { passCriteria }),
+      ...(variables && Object.keys(variables).length > 0 && { variables }),
+      ...(tags && tags.length > 0 && { tags }),
+      ...(viewport && { viewport }),
+      ...(timeout && { timeout }),
       screenshotCount: screenshots.length,
       artifactsDir: runDir,
       logFile,
@@ -639,14 +784,8 @@ server.tool(
 
     const browser = new McpBrowserManager();
     try {
-      const existingSseUrl = process.env.ASSRT_PLAYWRIGHT_SSE_URL;
-      if (existingSseUrl) {
-        server.server.sendLoggingMessage({ level: "info", data: `Connecting to existing Playwright MCP at ${existingSseUrl}...` });
-        await browser.launchExisting(existingSseUrl);
-      } else {
-        server.server.sendLoggingMessage({ level: "info", data: "Launching local browser..." });
-        await browser.launchLocal();
-      }
+      server.server.sendLoggingMessage({ level: "info", data: "Launching local browser..." });
+      await browser.launchLocal();
 
       server.server.sendLoggingMessage({ level: "info", data: `Navigating to ${url}...` });
       await browser.navigate(url);
@@ -886,8 +1025,29 @@ async function main() {
   await server.connect(transport);
   console.error("[assrt-mcp] server started, waiting for JSON-RPC on stdin");
 
-  process.on("SIGINT", async () => { await shutdownTelemetry(); process.exit(0); });
-  process.on("SIGTERM", async () => { await shutdownTelemetry(); process.exit(0); });
+  const gracefulShutdown = async (signal: string) => {
+    console.error(`[assrt-mcp] received ${signal}, cleaning up...`);
+    if (sharedBrowser) {
+      try {
+        await sharedBrowser.close();
+        console.error("[assrt-mcp] shared browser closed");
+      } catch (err) {
+        console.error("[assrt-mcp] error closing shared browser:", err);
+      }
+      sharedBrowser = null;
+    }
+    await shutdownTelemetry();
+    process.exit(0);
+  };
+
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+  process.on("beforeExit", async () => {
+    if (sharedBrowser) {
+      try { await sharedBrowser.close(); } catch { /* best effort */ }
+      sharedBrowser = null;
+    }
+  });
 }
 
 main().catch((err) => {
