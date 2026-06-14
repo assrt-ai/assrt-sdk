@@ -32,9 +32,10 @@ import { seed as runSeed, type SeedKind } from "../core/seed";
 let sharedBrowser: McpBrowserManager | null = null;
 
 // Build an Anthropic client from a resolved credential, honoring its type.
-// (Anthropic auth: OAuth tokens use authToken + the oauth beta header; plain
+// (Anthropic auth: "oauth" tokens use authToken + the oauth beta header;
+// "authToken" uses bearer with no beta header for a compatible gateway; plain
 // API keys use the apiKey field.)
-async function anthropicFromCredential(credential: { token: string; type: "oauth" | "apiKey"; provider: "anthropic" | "gemini" }) {
+async function anthropicFromCredential(credential: { token: string; type: "oauth" | "apiKey" | "authToken"; provider: "anthropic" | "gemini" }) {
   if (credential.provider !== "anthropic") {
     throw new Error(
       `Expected Anthropic credential, got '${credential.provider}'. ` +
@@ -42,15 +43,19 @@ async function anthropicFromCredential(credential: { token: string; type: "oauth
     );
   }
   const Anthropic = (await import("@anthropic-ai/sdk")).default;
-  return credential.type === "oauth"
-    ? new Anthropic({ authToken: credential.token, defaultHeaders: { "anthropic-beta": "oauth-2025-04-20" } })
-    : new Anthropic({ apiKey: credential.token });
+  if (credential.type === "oauth") {
+    return new Anthropic({ authToken: credential.token, defaultHeaders: { "anthropic-beta": "oauth-2025-04-20" } });
+  }
+  if (credential.type === "authToken") {
+    return new Anthropic({ authToken: credential.token });
+  }
+  return new Anthropic({ apiKey: credential.token });
 }
 
 // Build a Gemini client from a resolved credential. Used by assrt_plan and
 // assrt_diagnose when the user has Gemini selected in Fazm (ASSRT_PROVIDER=gemini)
 // so we don't force them through an Anthropic key they don't have.
-async function geminiFromCredential(credential: { token: string; type: "oauth" | "apiKey"; provider: "anthropic" | "gemini" }) {
+async function geminiFromCredential(credential: { token: string; type: "oauth" | "apiKey" | "authToken"; provider: "anthropic" | "gemini" }) {
   if (credential.provider !== "gemini") {
     throw new Error(
       `Expected Gemini credential, got '${credential.provider}'. ` +
