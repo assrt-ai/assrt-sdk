@@ -369,7 +369,7 @@ export class TestAgent {
     };
   }
 
-  constructor(apiKey: string, emit: EmitFn, model?: string, provider?: string, broadcastFrame?: ((jpeg: Buffer) => void) | null, mode?: AgentMode, authType?: "apiKey" | "oauth", videoDir?: string, headed?: boolean, isolated?: boolean, browser?: McpBrowserManager, extension?: boolean, extensionToken?: string, managed?: boolean) {
+  constructor(apiKey: string, emit: EmitFn, model?: string, provider?: string, broadcastFrame?: ((jpeg: Buffer) => void) | null, mode?: AgentMode, authType?: "apiKey" | "oauth" | "authToken", videoDir?: string, headed?: boolean, isolated?: boolean, browser?: McpBrowserManager, extension?: boolean, extensionToken?: string, managed?: boolean) {
     this.provider = (provider === "gemini" ? "gemini" : "anthropic") as Provider;
     this.browser = browser || new McpBrowserManager();
     this.emit = emit;
@@ -391,6 +391,9 @@ export class TestAgent {
           authToken: apiKey,
           defaultHeaders: { "anthropic-beta": "oauth-2025-04-20" },
         });
+      } else if (authType === "authToken") {
+        // Bearer auth for an Anthropic-compatible gateway. No oauth beta header.
+        this.anthropic = new Anthropic({ authToken: apiKey });
       } else {
         this.anthropic = new Anthropic({ apiKey });
       }
