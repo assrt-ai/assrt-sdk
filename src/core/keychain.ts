@@ -42,7 +42,16 @@ interface ClaudeCredentials {
 export interface AuthCredential {
   /** The OAuth access token or API key. */
   token: string;
-  type: "oauth" | "apiKey";
+  /**
+   * How the token authenticates:
+   *   "apiKey"    → sent as the x-api-key header (standard Anthropic / Gemini key).
+   *   "oauth"     → Authorization: Bearer + the Claude Code oauth beta header.
+   *   "authToken" → Authorization: Bearer with NO beta header. For an
+   *                 Anthropic-compatible gateway (litellm, internal proxy) that
+   *                 speaks bearer auth the Claude-Code way but is not Anthropic
+   *                 OAuth, so the oauth-2025-04-20 beta header must be omitted.
+   */
+  type: "oauth" | "apiKey" | "authToken";
   /** Which model provider this credential authenticates. The agent loop
    *  branches on this to pick the SDK (Anthropic vs Gemini). */
   provider: "anthropic" | "gemini";
@@ -147,7 +156,17 @@ export function getCredential(): AuthCredential {
     return { token: anthropicKey, type: "apiKey", provider: "anthropic" };
   }
 
-  // 3. GEMINI_API_KEY env var (last-resort fallback → Gemini provider).
+  // 3. ANTHROPIC_AUTH_TOKEN env var (bearer auth for an Anthropic-compatible
+  //    gateway). Sent as Authorization: Bearer with no oauth beta header so a
+  //    proxy that authenticates the Claude-Code way still accepts it. Honors
+  //    ANTHROPIC_BASE_URL, which the SDK reads from env on its own.
+  const anthropicAuthToken = process.env.ANTHROPIC_AUTH_TOKEN;
+  if (anthropicAuthToken) {
+    console.error("[auth] Using ANTHROPIC_AUTH_TOKEN env var (anthropic, bearer)");
+    return { token: anthropicAuthToken, type: "authToken", provider: "anthropic" };
+  }
+
+  // 4. GEMINI_API_KEY env var (last-resort fallback → Gemini provider).
   const geminiKey = process.env.GEMINI_API_KEY;
   if (geminiKey) {
     console.error("[auth] Using GEMINI_API_KEY env var (gemini)");
@@ -157,7 +176,8 @@ export function getCredential(): AuthCredential {
   throw new Error(
     "No credentials found. Provide one of:\n" +
     "  - Log in to Claude Code (`claude` in terminal) to store an OAuth token in Keychain (preferred), or\n" +
-    "  - Set ANTHROPIC_API_KEY (Anthropic fallback), or\n" +
+    "  - Set ANTHROPIC_API_KEY (Anthropic, or a gateway that accepts x-api-key), or\n" +
+    "  - Set ANTHROPIC_AUTH_TOKEN (Anthropic-compatible gateway with bearer auth; honors ANTHROPIC_BASE_URL), or\n" +
     "  - Set GEMINI_API_KEY (Gemini fallback)."
   );
 }
